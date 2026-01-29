@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -14,11 +15,15 @@ import (
 )
 
 type Video struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Thumbnail   string `json:"thumbnail"`
-	PublishedAt string `json:"published_at"`
-	URL         string `json:"url"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Thumbnail    string `json:"thumbnail"`
+	PublishedAt  string `json:"published_at"`
+	URL          string `json:"url"`
+	Duration     string `json:"duration"`
+	LikeCount    uint64 `json:"like_count"`
+	DislikeCount uint64 `json:"dislike_count"`
+	ViewCount    uint64 `json:"view_count"`
 }
 
 type ChannelStats struct {
@@ -34,27 +39,34 @@ type Output struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+	}))
+
+	durationFilter := 60 // in seconds
 	err := godotenv.Load()
 	if err != nil {
-		slog.Warn("error in loading the .env file, relying on system variables")
+		logger.Warn("error in loading the .env file, relying on system variables")
 	}
 
 	apiKey := os.Getenv("YOUTUBE_API_KEY")
 	channelID := os.Getenv("CHANNEL_ID")
 	if apiKey == "" || channelID == "" {
-		slog.Error("YOUTUBE_API_KEY and CHANNEL_ID must be set")
+		logger.Error("YOUTUBE_API_KEY and CHANNEL_ID must be set")
+		os.Exit(1)
 	}
 
 	service, err := youtube.NewService(context.Background(), option.WithAPIKey(apiKey))
 	if err != nil {
-		log.Fatalf("error in creating the Youtube service: %w", err)
+		logger.Error("error in creating the Youtube service", "error", err.Error())
 	}
 
-	slog.Info("Fetching the channel stats")
+	logger.Info("Fetching the channel stats")
 	channelCall := service.Channels.List([]string{"statistics"}).Id(channelID)
 	channelResponse, err := channelCall.Do()
 	if err != nil {
-		log.Fatalf("error in fecthing the changel stats: %w", err)
+		logger.Error("error in fetching the channel stats", "error", err.Error())
+		os.Exit(1)
 	}
 
 	stats := ChannelStats{
@@ -63,44 +75,86 @@ func main() {
 		VideoCount:      channelResponse.Items[0].Statistics.VideoCount,
 	}
 
-	slog.Info("fetching latest videos")
-	searchCall := service.Search.List([]string{"snippet"}).ChannelId(channelID).Order("date").Type("video").MaxResults(6)
+	logger.Info("fetching latest videos")
+	searchCall := service.Search.List([]string{"id"}).ChannelId(channelID).Order("date").Type("video").MaxResults(50)
 	searchResults, err := searchCall.Do()
 	if err != nil {
-		log.Fatalf("error in fetching the latest videos: %v", err.Error())
+		logger.Error("error in fetching the latest videos", "error", err.Error())
+		os.Exit(1)
 	}
 
-	videos := make([]Video, 0, 6)
+	videoIDs := []string{}
 	for _, item := range searchResults.Items {
-		v := Video{
-			ID:          item.Id.VideoId,
-			Title:       item.Snippet.Title,
-			Thumbnail:   item.Snippet.Thumbnails.High.Url,
-			PublishedAt: item.Snippet.PublishedAt,
-			URL:         "https://www.youtube.com/" + item.Id.VideoId,
+		videoIDs = append(videoIDs, item.Id.VideoId)
+	}
+
+	var longFormVideos []Video
+
+	videoCall := service.Videos.List([]string{"snippet", "contentDetails", "statistics"}).Id(videoIDs...)
+	videoResults, err := videoCall.Do()
+	if err != nil {
+		logger.Error("error is fetching video properties", "error", err.Error())
+		os.Exit(1)
+	}
+
+	for _, item := range videoResults.Items {
+
+		duration, err := parseDuration(item.ContentDetails.Duration)
+		if err != nil {
+			logger.Error("error in parsing the time", "error", err)
+			continue
 		}
-		videos = append(videos, v)
+		if duration.Seconds() > float64(durationFilter) {
+			v := Video{
+				ID:           item.Id,
+				Title:        item.Snippet.Title,
+				Thumbnail:    item.Snippet.Thumbnails.High.Url,
+				PublishedAt:  item.Snippet.PublishedAt,
+				URL:          "https://www.youtube.com/watch?v=" + item.Id,
+				LikeCount:    item.Statistics.LikeCount,
+				DislikeCount: item.Statistics.DislikeCount,
+				ViewCount:    item.Statistics.ViewCount,
+			}
+			longFormVideos = append(longFormVideos, v)
+		}
 	}
 
 	finalOutput := Output{
 		LastUpdated:  time.Now().Format(time.RFC3339),
 		Stats:        stats,
-		LatestVideos: videos,
+		LatestVideos: longFormVideos,
 	}
 
 	file, err := json.MarshalIndent(finalOutput, "", " ")
 	if err != nil {
-		log.Fatalf("error in marhalling the data: %v", err.Error())
+		logger.Error("error in marshalling the data", "error", err.Error())
+		os.Exit(1)
 	}
 
 	if _, err := os.Stat("data"); os.IsNotExist(err) {
-		os.Mkdir("data", 0o755)
+		if err := os.Mkdir("data", 0o755); err != nil {
+			logger.Error("error in creating the folder", "error", err.Error())
+			os.Exit(1)
+		}
 	}
 
 	err = os.WriteFile("data/youtube.json", file, 0o644)
 	if err != nil {
-		log.Fatalf("error in writing file: %v", err.Error)
+		logger.Error("error in writing file", "error", err.Error())
+		os.Exit(1)
 	}
 
-	slog.Info("Success! data is writen to youtube.json file")
+	logger.Info("Success! data is written to youtube.json file")
+}
+
+// parseDuration (Format is ISO 8601, e.g., PT1H2M10S)
+func parseDuration(isoDuration string) (time.Duration, error) {
+	cleanTime := strings.ToLower(isoDuration)
+	cleanTime = strings.TrimPrefix(cleanTime, "pt")
+
+	d, err := time.ParseDuration(cleanTime)
+	if err != nil {
+		return 0, fmt.Errorf("error in parsing the time: %w", err)
+	}
+	return d, nil
 }
